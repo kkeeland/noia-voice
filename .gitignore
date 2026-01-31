@@ -1,0 +1,38 @@
+# Xcode / Swift .gitignore
+
+# Build
+build/
+DerivedData/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcshareddata/IDEWorkspaceChecks.plist
+
+# CocoaPods / SPM
+Pods/
+.build/
+Package.resolved
+
+# Environment & secrets - NEVER commit
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*oauth*
+*token*.json
+*secret*.json
+*credential*.json
+
+# OS files
+.DS_Store
+._*
+
+# Sync conflict files
+*.sync-conflict-*
+.stfolder/
+
+# Temporary
+*.ipa
+*.dSYM.zip
+*.dSYM
