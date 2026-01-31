@@ -1,4 +1,4 @@
-// GatewayClient.swift — WebSocket client for Clawdbot gateway
+// GatewayClient.swift — WebSocket client for Clawdbot gateway (v2 protocol)
 // Noia Voice © 2025
 
 import Foundation
@@ -8,7 +8,7 @@ final class GatewayClient: ObservableObject {
     
     @Published private(set) var connectionState: ConnectionState = .disconnected
     
-    /// Fires for each response chunk
+    /// Fires for each response text delta
     let responseChunk = PassthroughSubject<String, Never>()
     /// Fires when a full response is complete
     let responseComplete = PassthroughSubject<String, Never>()
@@ -23,9 +23,20 @@ final class GatewayClient: ObservableObject {
     private var reconnectAttempt = 0
     private let maxReconnectAttempt = 10
     private var shouldReconnect = true
+    
+    // Protocol state
+    private var pendingRequests: [String: PendingRequest] = [:]
+    private var currentRunId: String?
     private var accumulatedResponse = ""
+    private var isHandshakeComplete = false
+    private var requestCounter = 0
     
     private let settings: AppSettings
+    
+    struct PendingRequest {
+        let method: String
+        let completion: ((Bool, Any?, String?) -> Void)?
+    }
     
     init(settings: AppSettings = .shared) {
         self.settings = settings
@@ -39,19 +50,14 @@ final class GatewayClient: ObservableObject {
             return
         }
         
-        guard let token = KeychainHelper.read(.gatewayToken), !token.isEmpty else {
-            errorOccurred.send("No gateway token configured")
-            return
-        }
-        
         shouldReconnect = true
+        isHandshakeComplete = false
         
         DispatchQueue.main.async {
             self.connectionState = .connecting
         }
         
         var request = URLRequest(url: url)
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.timeoutInterval = 15
         
         // Configure session with custom delegate for TLS (tailnet self-signed)
@@ -64,22 +70,18 @@ final class GatewayClient: ObservableObject {
         webSocket = session?.webSocketTask(with: request)
         webSocket?.resume()
         
-        // Start listening
+        // Start listening for messages
         listenForMessages()
         
-        // Start ping timer
-        startPingTimer()
+        // Send connect handshake
+        sendConnectHandshake()
         
-        DispatchQueue.main.async {
-            self.connectionState = .connected
-            self.reconnectAttempt = 0
-        }
-        
-        print("[GW] Connected to \(url)")
+        print("[GW] Connecting to \(url)")
     }
     
     func disconnect() {
         shouldReconnect = false
+        isHandshakeComplete = false
         pingTimer?.invalidate()
         pingTimer = nil
         
@@ -87,31 +89,72 @@ final class GatewayClient: ObservableObject {
         webSocket = nil
         session?.invalidateAndCancel()
         session = nil
+        pendingRequests.removeAll()
+        currentRunId = nil
         
         DispatchQueue.main.async {
             self.connectionState = .disconnected
         }
     }
     
-    // MARK: - Send Message
+    // MARK: - Connect Handshake
+    
+    private func sendConnectHandshake() {
+        let token = KeychainHelper.read(.gatewayToken) ?? ""
+        
+        let connectFrame: [String: Any] = [
+            "type": "req",
+            "id": nextRequestId(),
+            "method": "connect",
+            "params": [
+                "minProtocol": 1,
+                "maxProtocol": 1,
+                "client": [
+                    "id": "noia-voice-ios",
+                    "displayName": "Noia Voice",
+                    "version": "1.0.0",
+                    "platform": "ios",
+                    "deviceFamily": "iPhone",
+                    "mode": "chat"
+                ] as [String: Any],
+                "auth": [
+                    "token": token
+                ]
+            ] as [String: Any]
+        ]
+        
+        sendJSON(connectFrame)
+    }
+    
+    // MARK: - Send Chat Message
     
     func sendChatMessage(_ text: String) {
-        let message = GatewayOutboundMessage.chat(text, sessionKey: settings.sessionKey)
-        
-        guard let data = try? JSONEncoder().encode(message) else {
-            errorOccurred.send("Failed to encode message")
+        guard isHandshakeComplete else {
+            print("[GW] Cannot send — handshake not complete")
+            errorOccurred.send("Not connected to gateway")
             return
         }
         
-        webSocket?.send(.data(data)) { [weak self] error in
-            if let error = error {
-                print("[GW] Send error: \(error.localizedDescription)")
-                self?.errorOccurred.send("Send failed: \(error.localizedDescription)")
-                self?.handleDisconnect()
-            }
-        }
+        let reqId = nextRequestId()
+        let idempotencyKey = UUID().uuidString
         
+        let frame: [String: Any] = [
+            "type": "req",
+            "id": reqId,
+            "method": "chat.send",
+            "params": [
+                "sessionKey": settings.sessionKey ?? "voice-iphone",
+                "message": text,
+                "idempotencyKey": idempotencyKey
+            ] as [String: Any]
+        ]
+        
+        pendingRequests[reqId] = PendingRequest(method: "chat.send", completion: nil)
         accumulatedResponse = ""
+        currentRunId = nil
+        
+        sendJSON(frame)
+        print("[GW] Sent chat.send: \(text.prefix(50))")
     }
     
     // MARK: - Receive Messages
@@ -144,44 +187,183 @@ final class GatewayClient: ObservableObject {
     
     private func handleInbound(_ json: String) {
         guard let data = json.data(using: .utf8),
-              let msg = try? JSONDecoder().decode(GatewayInboundMessage.self, from: data) else {
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = obj["type"] as? String else {
             print("[GW] Failed to decode: \(json.prefix(200))")
             return
         }
         
-        switch msg.messageType {
-        case .responseStart:
-            accumulatedResponse = ""
-            responseStarted.send()
+        switch type {
+        case "hello-ok":
+            handleHelloOk(obj)
             
-        case .responseChunk:
-            if let chunk = msg.content {
-                accumulatedResponse += chunk
-                responseChunk.send(chunk)
+        case "res":
+            handleResponse(obj)
+            
+        case "event":
+            handleEvent(obj)
+            
+        default:
+            print("[GW] Unknown frame type: \(type)")
+        }
+    }
+    
+    // MARK: - Frame Handlers
+    
+    private func handleHelloOk(_ obj: [String: Any]) {
+        isHandshakeComplete = true
+        reconnectAttempt = 0
+        
+        DispatchQueue.main.async {
+            self.connectionState = .connected
+        }
+        
+        // Start ping timer
+        startPingTimer()
+        
+        if let server = obj["server"] as? [String: Any],
+           let version = server["version"] as? String {
+            print("[GW] Connected — server v\(version)")
+        } else {
+            print("[GW] Connected (hello-ok)")
+        }
+    }
+    
+    private func handleResponse(_ obj: [String: Any]) {
+        guard let id = obj["id"] as? String else { return }
+        
+        let ok = obj["ok"] as? Bool ?? false
+        
+        if let pending = pendingRequests.removeValue(forKey: id) {
+            if !ok {
+                let error = obj["error"] as? [String: Any]
+                let message = error?["message"] as? String ?? "Request failed"
+                print("[GW] \(pending.method) error: \(message)")
+                
+                if pending.method == "chat.send" {
+                    errorOccurred.send(message)
+                }
+            } else {
+                // chat.send accepted — response will come via events
+                if pending.method == "chat.send" {
+                    if let payload = obj["payload"] as? [String: Any],
+                       let runId = payload["runId"] as? String {
+                        currentRunId = runId
+                    }
+                }
             }
             
-        case .responseEnd:
-            let finalContent = msg.content ?? accumulatedResponse
-            responseComplete.send(finalContent)
+            pending.completion?(ok, obj["payload"], ok ? nil : "failed")
+        }
+    }
+    
+    private func handleEvent(_ obj: [String: Any]) {
+        guard let event = obj["event"] as? String else { return }
+        
+        switch event {
+        case "chat":
+            handleChatEvent(obj["payload"] as? [String: Any] ?? [:])
+            
+        case "tick":
+            // Heartbeat from server — connection is alive
+            break
+            
+        case "snapshot":
+            // State snapshot — ignore for voice
+            break
+            
+        default:
+            print("[GW] Unhandled event: \(event)")
+        }
+    }
+    
+    private func handleChatEvent(_ payload: [String: Any]) {
+        guard let state = payload["state"] as? String else { return }
+        
+        switch state {
+        case "delta":
+            // Extract text content from the message
+            if let message = payload["message"] as? [String: Any],
+               let content = message["content"] as? [[String: Any]] {
+                for block in content {
+                    if let blockType = block["type"] as? String, blockType == "text",
+                       let text = block["text"] as? String {
+                        // First delta means response started
+                        if accumulatedResponse.isEmpty {
+                            responseStarted.send()
+                        }
+                        accumulatedResponse += text
+                        responseChunk.send(text)
+                    }
+                }
+            }
+            
+        case "final":
+            // Extract final text
+            var finalText = accumulatedResponse
+            if let message = payload["message"] as? [String: Any],
+               let content = message["content"] as? [[String: Any]] {
+                var fullText = ""
+                for block in content {
+                    if let blockType = block["type"] as? String, blockType == "text",
+                       let text = block["text"] as? String {
+                        fullText += text
+                    }
+                }
+                if !fullText.isEmpty {
+                    finalText = fullText
+                }
+            }
+            
+            responseComplete.send(finalText)
             accumulatedResponse = ""
+            currentRunId = nil
             
-        case .error:
-            errorOccurred.send(msg.error ?? msg.content ?? "Unknown gateway error")
+        case "error":
+            let errorMsg = payload["errorMessage"] as? String ?? "Unknown error"
+            errorOccurred.send(errorMsg)
+            accumulatedResponse = ""
+            currentRunId = nil
             
-        case .pong:
-            break // Heartbeat acknowledged
+        case "aborted":
+            accumulatedResponse = ""
+            currentRunId = nil
             
-        case .unknown:
-            print("[GW] Unknown message type: \(msg.type)")
+        default:
+            print("[GW] Unknown chat state: \(state)")
+        }
+    }
+    
+    // MARK: - Helpers
+    
+    private func nextRequestId() -> String {
+        requestCounter += 1
+        return "nv-\(requestCounter)"
+    }
+    
+    private func sendJSON(_ obj: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: obj),
+              let text = String(data: data, encoding: .utf8) else {
+            print("[GW] Failed to serialize frame")
+            return
+        }
+        
+        webSocket?.send(.string(text)) { [weak self] error in
+            if let error = error {
+                print("[GW] Send error: \(error.localizedDescription)")
+                self?.handleDisconnect()
+            }
         }
     }
     
     // MARK: - Heartbeat
     
     private func startPingTimer() {
-        pingTimer?.invalidate()
-        pingTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            self?.sendPing()
+        DispatchQueue.main.async {
+            self.pingTimer?.invalidate()
+            self.pingTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+                self?.sendPing()
+            }
         }
     }
     
@@ -199,6 +381,7 @@ final class GatewayClient: ObservableObject {
     private func handleDisconnect() {
         guard shouldReconnect else { return }
         
+        isHandshakeComplete = false
         reconnectAttempt += 1
         
         if reconnectAttempt > maxReconnectAttempt {
@@ -222,6 +405,8 @@ final class GatewayClient: ObservableObject {
             guard let self = self, self.shouldReconnect else { return }
             self.webSocket?.cancel(with: .goingAway, reason: nil)
             self.webSocket = nil
+            self.session?.invalidateAndCancel()
+            self.session = nil
             self.connect()
         }
     }
@@ -253,7 +438,7 @@ private class WebSocketDelegate: NSObject, URLSessionWebSocketDelegate {
         webSocketTask: URLSessionWebSocketTask,
         didOpenWithProtocol protocol: String?
     ) {
-        print("[GW] WebSocket opened")
+        print("[GW] WebSocket transport opened")
     }
     
     func urlSession(

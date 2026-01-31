@@ -3,48 +3,15 @@
 
 import Foundation
 
-// MARK: - Gateway Messages
-
-struct GatewayOutboundMessage: Codable {
-    let type: String
-    let content: String
-    let sessionKey: String
-    let metadata: MessageMetadata?
-    
-    struct MessageMetadata: Codable {
-        let source: String
-        let inputMethod: String
-    }
-    
-    static func chat(_ text: String, sessionKey: String = "voice-iphone") -> GatewayOutboundMessage {
-        GatewayOutboundMessage(
-            type: "chat.message",
-            content: text,
-            sessionKey: sessionKey,
-            metadata: MessageMetadata(source: "noia-voice", inputMethod: "speech")
-        )
-    }
-}
-
-struct GatewayInboundMessage: Codable {
-    let type: String
-    let content: String?
-    let sessionKey: String?
-    let error: String?
-    
-    var messageType: InboundType {
-        InboundType(rawValue: type) ?? .unknown
-    }
-    
-    enum InboundType: String {
-        case responseStart = "chat.response.start"
-        case responseChunk = "chat.response.chunk"
-        case responseEnd = "chat.response.end"
-        case error = "error"
-        case pong = "pong"
-        case unknown
-    }
-}
+// MARK: - Gateway Protocol
+// 
+// The Clawdbot gateway uses a structured WebSocket protocol:
+// - Connect handshake: req/connect → hello-ok
+// - Request/Response: {type:"req", id, method, params} → {type:"res", id, ok, payload}
+// - Events: {type:"event", event:"chat", payload:{state:"delta"|"final", message:{content:[...]}}}
+// 
+// All framing is handled in GatewayClient.swift using JSONSerialization.
+// No Codable models needed — the protocol is flexible enough to warrant dynamic handling.
 
 // MARK: - VAD State
 
