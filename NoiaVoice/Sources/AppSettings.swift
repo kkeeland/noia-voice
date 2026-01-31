@@ -36,7 +36,11 @@ final class AppSettings: ObservableObject {
     
     @AppStorage("autoActivateOnBluetooth") var autoActivateOnBluetooth: Bool = true
     @AppStorage("vadSensitivity") var vadSensitivity: Double = 0.5
-    @AppStorage("silenceThreshold") var silenceThreshold: Double = 1.5
+    @AppStorage("silenceThreshold") var silenceThreshold: Double = 2.4
+    
+    // MARK: - Speech Recognition
+    
+    @AppStorage("preferOnDeviceSTT") var preferOnDeviceSTT: Bool = false
     
     // MARK: - Audio Cues
     

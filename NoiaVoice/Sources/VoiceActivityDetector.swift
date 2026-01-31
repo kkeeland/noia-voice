@@ -10,7 +10,7 @@ final class VoiceActivityDetector: ObservableObject {
     
     var energyThreshold: Float = -40.0  // dB, will be calibrated
     var minSpeechFrames: Int = 5        // ~320ms at 1024/16kHz
-    var silenceFramesForEnd: Int = 24   // ~1.5s silence = end of utterance
+    var silenceFramesForEnd: Int = 38   // ~2.4s silence = end of utterance (people pause while driving)
     
     // MARK: - State
     

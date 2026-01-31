@@ -175,6 +175,9 @@ final class ConversationManager: ObservableObject {
                 return
             }
             
+            // Configure STT
+            speechRecognizer.preferOnDevice = settings.preferOnDeviceSTT
+            
             // Connect gateway
             gateway.connect()
             

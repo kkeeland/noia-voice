@@ -24,8 +24,11 @@ final class SpeechRecognizer: ObservableObject {
     // Contextual strings to improve recognition of custom vocabulary
     private let contextualStrings = [
         "Noia", "Clawdbot", "Adaptaphoria", "HelloSpore", "Bagtek",
-        "Kevin", "Tailnet", "gateway"
+        "Kevin", "Tailnet", "gateway", "Keeland"
     ]
+    
+    /// Whether to prefer on-device recognition (less accurate but private/offline)
+    var preferOnDevice: Bool = false
     
     init() {
         self.speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))!
@@ -56,12 +59,22 @@ final class SpeechRecognizer: ObservableObject {
         
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
-        request.requiresOnDeviceRecognition = true
         request.contextualStrings = contextualStrings
         
-        // Disable punctuation for cleaner voice-to-text
+        // Server-side recognition is significantly more accurate
+        // Only use on-device if user explicitly wants offline mode
+        if preferOnDevice && speechRecognizer.supportsOnDeviceRecognition {
+            request.requiresOnDeviceRecognition = true
+        }
+        
+        // Enable punctuation for natural text
         if #available(iOS 17.0, *) {
             request.addsPunctuation = true
+        }
+        
+        // Use best transcription task type for conversational speech
+        if #available(iOS 16.0, *) {
+            request.taskHint = .dictation
         }
         
         self.recognitionRequest = request

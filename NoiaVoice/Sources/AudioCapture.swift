@@ -8,8 +8,18 @@ final class AudioCapture: ObservableObject {
     
     private let engine = AVAudioEngine()
     private var isCapturing = false
+    private var converter: AVAudioConverter?
+    
+    /// Standard format for downstream processing (16kHz mono float32)
+    static let standardFormat = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32,
+        sampleRate: 16000,
+        channels: 1,
+        interleaved: false
+    )!
     
     /// Published audio buffers for downstream consumers (VAD, STT)
+    /// Always delivered in 16kHz mono float32 format
     let audioBufferSubject = PassthroughSubject<AVAudioPCMBuffer, Never>()
     
     @Published var isRunning = false
@@ -67,16 +77,53 @@ final class AudioCapture: ObservableObject {
         try configureAudioSession()
         
         let inputNode = engine.inputNode
-        let format = inputNode.outputFormat(forBus: 0)
+        let inputFormat = inputNode.outputFormat(forBus: 0)
         
         // Validate format
-        guard format.sampleRate > 0, format.channelCount > 0 else {
+        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
             throw AudioCaptureError.invalidFormat
         }
         
-        // Install tap — 1024 frames for low-latency VAD
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            self?.audioBufferSubject.send(buffer)
+        let targetFormat = AudioCapture.standardFormat
+        
+        // Create converter if input format differs from our standard 16kHz mono
+        if inputFormat.sampleRate != targetFormat.sampleRate ||
+           inputFormat.channelCount != targetFormat.channelCount {
+            converter = AVAudioConverter(from: inputFormat, to: targetFormat)
+            print("[Audio] Converting \(inputFormat.sampleRate)Hz/\(inputFormat.channelCount)ch → 16kHz/mono")
+        } else {
+            converter = nil
+            print("[Audio] Input already 16kHz mono — no conversion needed")
+        }
+        
+        // Install tap — use input's native format, convert downstream
+        // Buffer size scales with sample rate to maintain ~64ms windows
+        let bufferSize = AVAudioFrameCount(inputFormat.sampleRate * 0.064)
+        inputNode.installTap(onBus: 0, bufferSize: bufferSize, format: inputFormat) { [weak self] buffer, _ in
+            guard let self = self else { return }
+            
+            if let converter = self.converter {
+                // Convert to standard format
+                let frameCount = AVAudioFrameCount(
+                    Double(buffer.frameLength) * targetFormat.sampleRate / inputFormat.sampleRate
+                )
+                guard let convertedBuffer = AVAudioPCMBuffer(
+                    pcmFormat: targetFormat,
+                    frameCapacity: frameCount
+                ) else { return }
+                
+                var error: NSError?
+                let status = converter.convert(to: convertedBuffer, error: &error) { _, outStatus in
+                    outStatus.pointee = .haveData
+                    return buffer
+                }
+                
+                if status == .haveData || status == .inputRanDry {
+                    self.audioBufferSubject.send(convertedBuffer)
+                }
+            } else {
+                self.audioBufferSubject.send(buffer)
+            }
         }
         
         engine.prepare()
@@ -169,10 +216,10 @@ final class AudioCapture: ObservableObject {
         }
     }
     
-    /// Returns the current capture format for downstream use
+    /// Returns the standard output format (always 16kHz mono)
     var captureFormat: AVAudioFormat? {
         guard isCapturing else { return nil }
-        return engine.inputNode.outputFormat(forBus: 0)
+        return AudioCapture.standardFormat
     }
     
     deinit {
