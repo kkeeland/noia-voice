@@ -12,9 +12,11 @@ final class AppSettings: ObservableObject {
     @AppStorage("gatewayPort") var gatewayPort: Int = 18789
     @AppStorage("sessionKey") var sessionKey: String = "voice-iphone"
     
+    @AppStorage("gatewayUseTLS") var gatewayUseTLS: Bool = false
+    
     var gatewayWSURL: URL? {
-        // Gateway accepts WebSocket upgrade on any path
-        URL(string: "wss://\(gatewayHost):\(gatewayPort)/")
+        let scheme = gatewayUseTLS ? "wss" : "ws"
+        return URL(string: "\(scheme)://\(gatewayHost):\(gatewayPort)/")
     }
     
     // MARK: - Voice / TTS
